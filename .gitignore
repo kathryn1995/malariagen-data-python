@@ -6,6 +6,10 @@ dist
 
 .ipynb_checkpoints/
 gcs_cache
+results_cache
 
 # emacs
 *~
+
+# nbconvert outputs
+*.nbconvert.ipynb

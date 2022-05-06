@@ -1,5 +1,8 @@
+import hashlib
+import json
+import logging
 import re
-from collections import namedtuple
+import sys
 from collections.abc import Mapping
 from enum import Enum
 from urllib.parse import unquote_plus
@@ -91,6 +94,7 @@ def unpack_gff3_attributes(df, attributes):
 
 try:
     # zarr >= 2.11.0
+    # noinspection PyUnresolvedReferences
     from zarr.storage import KVStore
 
     class SafeStore(KVStore):
@@ -103,7 +107,6 @@ try:
 
         def __contains__(self, key):
             return key in self._mutable_mapping
-
 
 except ImportError:
     # zarr < 2.11.0
@@ -145,7 +148,7 @@ class SiteClass(Enum):
 def da_from_zarr(z, inline_array, chunks="auto"):
     """Utility function for turning a zarr array into a dask array.
 
-    N.B., dask does have it's own from_zarr() function but we roll
+    N.B., dask does have its own from_zarr() function, but we roll
     our own here to get a little more control.
 
     """
@@ -164,7 +167,7 @@ def da_from_zarr(z, inline_array, chunks="auto"):
 
 def dask_compress_dataset(ds, indexer, dim):
     """Temporary workaround for memory issues when attempting to
-    index an xarray dataset with a Boolean array.
+    index a xarray dataset with a Boolean array.
 
     See also: https://github.com/pydata/xarray/issues/5054
 
@@ -260,7 +263,7 @@ def da_compress(indexer, data, axis):
 
 
 def init_filesystem(url, **kwargs):
-    """Initialise an fsspec filesystem from a given base URL and parameters."""
+    """Initialise a fsspec filesystem from a given base URL and parameters."""
 
     # special case Google Cloud Storage, use anonymous access, avoids a delay
     if url.startswith("gs://") or url.startswith("gcs://"):
@@ -283,17 +286,66 @@ def init_filesystem(url, **kwargs):
 
 
 def init_zarr_store(fs, path):
-    """Initialise a zarr store (mapping) from an fsspec filesystem."""
+    """Initialise a zarr store (mapping) from a fsspec filesystem."""
 
     return SafeStore(FSMap(fs=fs, root=path, check=False, create=False))
 
 
-Region = namedtuple("Region", ["contig", "start", "end"])
+# N.B., previously Region was defined as a named tuple. However, this led to
+# some subtle bugs where instances where treated as normal tuples. So to avoid
+# confusion, create a dedicated class.
+
+
+class Region:
+    """A region of a reference genome, i.e., a contig or contig interval."""
+
+    def __init__(self, contig, start=None, end=None):
+        self._contig = contig
+        self._start = start
+        self._end = end
+
+    @property
+    def contig(self):
+        return self._contig
+
+    @property
+    def start(self):
+        return self._start
+
+    @property
+    def end(self):
+        return self._end
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, Region)
+            and (self.contig == other.contig)
+            and (self.start == other.start)
+            and (self.end == other.end)
+        )
+
+    def __str__(self):
+        out = self._contig
+        if self._start is not None or self._end is not None:
+            out += ":"
+            if self._start is not None:
+                out += f"{self._start:,}"
+            out += "-"
+            if self.end is not None:
+                out += f"{self._end:,}"
+        return out
+
+    def to_dict(self):
+        return dict(
+            contig=self.contig,
+            start=self.start,
+            end=self.end,
+        )
 
 
 def _handle_region_coords(resource, region):
 
-    region_pattern_match = re.search(r"([a-zA-Z0-9]+)\:(.+)\-(.+)", region)
+    region_pattern_match = re.search("([a-zA-Z0-9]+):(.+)-(.+)", region)
     if region_pattern_match:
         # parse region string that contains genomic coordinates
         region_split = region_pattern_match.groups()
@@ -323,7 +375,7 @@ def _handle_region_feature(resource, region):
     if not results.empty:
         # region is a feature ID
         feature = results.squeeze()
-        return Region(feature.contig, feature.start, feature.end)
+        return Region(feature.contig, int(feature.start), int(feature.end))
     else:
         return None
 
@@ -335,6 +387,13 @@ def resolve_region(resource, region):
     if isinstance(region, Region):
         # region is already Region tuple, nothing to do
         return region
+
+    if isinstance(region, dict):
+        return Region(
+            contig=region.get("contig"),
+            start=region.get("start"),
+            end=region.get("end"),
+        )
 
     if isinstance(region, (list, tuple)):
         # multiple regions, normalise to list and resolve components
@@ -369,7 +428,7 @@ def locate_region(region, pos):
     Parameters
     ----------
     region : Region
-        Region to locate.
+        The region to locate.
     pos : array-like
         Positions to be searched.
 
@@ -383,8 +442,124 @@ def locate_region(region, pos):
     return loc_region
 
 
-def xarray_concat(datasets, **kwargs):
-    if len(datasets) == 0:
+def xarray_concat(
+    datasets,
+    dim,
+    data_vars="minimal",
+    coords="minimal",
+    compat="override",
+    join="override",
+    **kwargs,
+):
+    if len(datasets) == 1:
         return datasets[0]
     else:
-        return xr.concat(datasets, **kwargs)
+        return xr.concat(
+            datasets,
+            dim=dim,
+            data_vars=data_vars,
+            coords=coords,
+            compat=compat,
+            join=join,
+            **kwargs,
+        )
+
+
+def type_error(
+    name,
+    value,
+    expectation,
+):
+    message = (
+        f"Bad type for parameter {name}; expected {expectation}, "
+        f"found {type(value)}"
+    )
+    raise TypeError(message)
+
+
+def value_error(
+    name,
+    value,
+    expectation,
+):
+    message = (
+        f"Bad value for parameter {name}; expected {expectation}, " f"found {value!r}"
+    )
+    raise ValueError(message)
+
+
+def check_type(
+    name,
+    value,
+    expectation,
+):
+    if not isinstance(value, expectation):
+        type_error(name, value, expectation)
+
+
+def hash_params(params):
+    """Helper function to hash function parameters."""
+    s = json.dumps(params, sort_keys=True, indent=4)
+    h = hashlib.md5(s.encode()).hexdigest()
+    return h, s
+
+
+def jitter(a, fraction):
+    """Jitter data in `a` using the fraction `f`."""
+    r = a.max() - a.min()
+    return a + fraction * np.random.uniform(-r, r, a.shape)
+
+
+class CacheMiss(Exception):
+    pass
+
+
+class LoggingHelper:
+    def __init__(self, name, out, debug=False):
+
+        # set up a logger
+        logger = logging.getLogger(name)
+        logger.setLevel(logging.DEBUG)
+        self._logger = logger
+
+        # set up handler
+        handler = None
+        if isinstance(out, str):
+            handler = logging.FileHandler(out)
+        elif hasattr(out, "write"):
+            handler = logging.StreamHandler(out)
+        self._handler = handler
+
+        # configure handler
+        if handler is not None:
+            if debug:
+                handler.setLevel(logging.DEBUG)
+            else:
+                handler.setLevel(logging.INFO)
+            formatter = logging.Formatter(fmt="[%(levelname)s] %(message)s")
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+
+    def flush(self):
+        if self._handler is not None:
+            self._handler.flush()
+
+    def debug(self, msg):
+
+        # get the name of the calling function, helps with debugging
+        caller_name = sys._getframe().f_back.f_code.co_name
+        msg = f"{caller_name}: {msg}"
+        self._logger.debug(msg)
+
+        # flush messages immediately
+        self.flush()
+
+    def info(self, msg):
+        self._logger.info(msg)
+
+        # flush messages immediately
+        self.flush()
+
+    def set_level(self, level):
+        if self._handler is not None:
+            self._handler.setLevel(level)

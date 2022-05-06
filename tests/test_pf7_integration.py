@@ -2,7 +2,6 @@ import dask.array as da
 import numpy as np
 import pytest
 import xarray
-import zarr
 
 from malariagen_data.pf7 import Pf7
 
@@ -52,12 +51,6 @@ def test_sample_metadata(url):
     assert tuple(df_samples.columns) == expected_cols
     expected_len = 20864
     assert len(df_samples) == expected_len
-
-
-def test_open_variant_calls_zarr():
-    pf7 = setup_pf7()
-    root = pf7.open_variant_calls_zarr()
-    assert isinstance(root, zarr.hierarchy.Group)
 
 
 @pytest.mark.parametrize("extended", [True, False])
